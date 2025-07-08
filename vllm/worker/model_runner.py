@@ -1091,6 +1091,10 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         self.max_batchsize_to_capture = \
             self.vllm_config.compilation_config.max_capture_size
 
+        # ToRA configuration
+        self.config = vllm_config.additional_config
+        self._result_queue = None  # Will be set by the executor
+
         #
         self.graph_runners: List[Dict[Tuple[int, bool], CUDAGraphRunner]] = [
             {} for _ in range(self.parallel_config.pipeline_parallel_size)
@@ -1893,6 +1897,57 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         logits = self.model.compute_logits(hidden_or_intermediate_states,
                                            model_input.sampling_metadata)
 
+        # wj: ---- ToRA Phase-A: Hybrid per-token utility score ------------------------
+        # Only fire on incremental-decode steps and only from the driver.
+        is_decode = model_input.attn_metadata.prefill_metadata is None
+        
+        # Debug logging to understand the flow
+        logger.info(f"ToRA DEBUG: kv_pruner={self.config.get('kv_pruner')}, is_decode={is_decode}, is_driver_worker={self.is_driver_worker}, result_queue={self._result_queue is not None}")
+        
+        if (self.config.get("kv_pruner") == "tora.block"
+                and is_decode
+                and self.is_driver_worker
+                #and self._result_queue is not None
+                ):
+            # Get sequence IDs from sampling metadata
+            seq_ids = []
+            if model_input.sampling_metadata and model_input.sampling_metadata.seq_groups:
+                for seq_group in model_input.sampling_metadata.seq_groups:
+                    seq_ids.extend(seq_group.seq_ids)
+            
+            # Phase A.1: Score tokens in the KV cache using value-based approach
+            kv_cache_scores = self._score_kv_cache_tokens(
+                kv_caches, model_input.attn_metadata, seq_ids)
+            
+            # Phase A.2: Score current tokens using hidden state representations
+            current_scores = None
+            if isinstance(hidden_or_intermediate_states, torch.Tensor):
+                # Handle different tensor shapes
+                if hidden_or_intermediate_states.dim() == 3:
+                    # [B, seq_len, d] -> [B, d]
+                    last_h = hidden_or_intermediate_states[:, -1, :]
+                elif hidden_or_intermediate_states.dim() == 2:
+                    # [B, d] -> already the last hidden state
+                    last_h = hidden_or_intermediate_states
+                else:
+                    logger.warning(f"Unexpected hidden states shape: {hidden_or_intermediate_states.shape}")
+                    return
+                
+                # Use L2 norm of hidden states for current token scoring
+                current_scores = torch.linalg.vector_norm(last_h.float(), dim=-1)  # [B]
+            
+            # Phase A.3: Hybrid scoring - combine current and cached token scores
+            hybrid_scores = self._compute_hybrid_scores(
+                current_scores, kv_cache_scores, seq_ids, model_input.attn_metadata)
+            
+            # Log the ToRA scores for debugging
+            logger.info(f"ToRA HYBRID SCORES: seq_ids={seq_ids}, current_scores={current_scores.tolist() if current_scores is not None else None}, kv_cache_scores={kv_cache_scores}, hybrid_scores={hybrid_scores}")
+            
+            # piggy-back on the existing GPU→CPU IPC queue
+            if self._result_queue is not None:
+                self._result_queue.put(("tora_hybrid_scores", seq_ids, current_scores, kv_cache_scores, hybrid_scores))
+        # --------------------------------------------------------------------
+        
         if self.is_driver_worker:
             if model_input.async_callback is not None:
                 model_input.async_callback()
@@ -2014,6 +2069,208 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
 
         return self.vllm_config.kv_transfer_config.is_kv_producer and (
             not is_profile_run) and is_prefill_run
+
+    # wj: ---- ToRA Phase-A: per-token utility score in kv cache ------------------------
+    def _score_kv_cache_tokens(self, kv_caches: List[torch.Tensor], 
+                              attn_metadata, seq_ids: List[int]) -> Dict[int, List[float]]:
+        """
+        Score tokens in the KV cache using multiple approaches for better alignment.
+        
+        Args:
+            kv_caches: List of KV cache tensors for each layer
+            attn_metadata: Attention metadata containing slot_mapping and block_tables
+            seq_ids: List of sequence IDs to score
+            
+        Returns:
+            Dict mapping seq_id to list of token scores
+        """
+        if not kv_caches or not seq_ids:
+            return {}
+        
+        # Use both key and value caches from the last layer
+        kv_cache = kv_caches[-1]  # Shape: [2, num_blocks, num_heads, block_size, head_size]
+        key_cache = kv_cache[0]   # Shape: [num_blocks, num_heads, block_size, head_size]
+        value_cache = kv_cache[1] # Shape: [num_blocks, num_heads, block_size, head_size]
+        
+        # Get slot mapping to understand which tokens are where
+        slot_mapping = attn_metadata.slot_mapping  # Shape: [num_tokens]
+        
+        # Group tokens by sequence ID
+        seq_token_scores = {}
+        
+        # For each sequence, compute scores for its cached tokens
+        for seq_id in seq_ids:
+            if slot_mapping.numel() > 0:
+                # Get the slots for this sequence's tokens
+                valid_slots = slot_mapping[slot_mapping >= 0]  # Remove padding slots
+                
+                if valid_slots.numel() > 0:
+                    # Convert slot indices to block and offset
+                    block_size = key_cache.size(2)  # block_size dimension
+                    block_indices = valid_slots // block_size
+                    block_offsets = valid_slots % block_size
+                    
+                    # Extract key and value vectors for these slots
+                    # Shape: [num_valid_tokens, num_heads, head_size]
+                    key_vectors = key_cache[block_indices, :, block_offsets, :]
+                    value_vectors = value_cache[block_indices, :, block_offsets, :]
+                    
+                    # Method 1: Key-only scoring (original approach)
+                    key_scores = torch.linalg.vector_norm(key_vectors.float(), dim=-1)
+                    avg_key_scores = key_scores.mean(dim=1)
+                    
+                    # Method 2: Value-only scoring (often more informative)
+                    value_scores = torch.linalg.vector_norm(value_vectors.float(), dim=-1)
+                    avg_value_scores = value_scores.mean(dim=1)
+                    
+                    # Method 3: Combined key-value scoring
+                    # Concatenate key and value vectors along head dimension
+                    combined_vectors = torch.cat([key_vectors, value_vectors], dim=1)
+                    combined_scores = torch.linalg.vector_norm(combined_vectors.float(), dim=-1)
+                    avg_combined_scores = combined_scores.mean(dim=1)
+                    
+                    # Method 4: Use value scores with better normalization
+                    # Values are often more informative for token utility
+                    head_size = value_vectors.size(-1)
+                    num_heads = value_vectors.size(1)
+                    
+                    # Normalize by sqrt(head_size * num_heads) for better scaling
+                    normalized_value_scores = avg_value_scores * (head_size * num_heads) ** 0.5
+                    
+                    # Use the normalized value scores as they're most comparable
+                    seq_token_scores[seq_id] = normalized_value_scores.tolist()
+                else:
+                    seq_token_scores[seq_id] = []
+            else:
+                seq_token_scores[seq_id] = []
+        
+        return seq_token_scores
+
+    def _compute_hybrid_scores(self, current_scores: Optional[torch.Tensor], 
+                              kv_cache_scores: Dict[int, List[float]], 
+                              seq_ids: List[int], 
+                              attn_metadata) -> Dict[int, Dict[str, float]]:
+        """
+        Compute hybrid ToRA scores by combining current token scores and KV cache scores.
+        
+        This implements the Phase A hybrid approach that balances accuracy and practicality:
+        - Current tokens: Use final hidden state representations (most accurate)
+        - Cached tokens: Use value-based KV cache representations (practical)
+        - Hybrid: Weighted combination based on token importance and recency
+        
+        Args:
+            current_scores: Tensor of current token scores [B]
+            kv_cache_scores: Dict mapping seq_id to list of cached token scores
+            seq_ids: List of sequence IDs
+            attn_metadata: Attention metadata for context information
+            
+        Returns:
+            Dict mapping seq_id to dict with 'current', 'cached', 'hybrid', and 'weights' scores
+        """
+        hybrid_results = {}
+        
+        if current_scores is None or len(seq_ids) == 0:
+            return hybrid_results
+        
+        # Get sequence information for better weighting
+        seq_lens = attn_metadata.seq_lens if hasattr(attn_metadata, 'seq_lens') else None
+        context_lens = attn_metadata.context_lens if hasattr(attn_metadata, 'context_lens') else None
+        
+        for i, seq_id in enumerate(seq_ids):
+            if i >= current_scores.shape[0]:
+                break
+                
+            current_score = current_scores[i].item()
+            cached_scores = kv_cache_scores.get(seq_id, [])
+            
+            # Compute hybrid score using weighted combination
+            hybrid_score, weights = self._combine_scores_hybrid(
+                current_score, cached_scores, seq_id, seq_lens, context_lens, i)
+            
+            hybrid_results[seq_id] = {
+                'current': current_score,
+                'cached': cached_scores,
+                'hybrid': hybrid_score,
+                'weights': weights,
+                'num_cached_tokens': len(cached_scores)
+            }
+        
+        return hybrid_results
+    
+    def _combine_scores_hybrid(self, current_score: float, 
+                              cached_scores: List[float], 
+                              seq_id: int,
+                              seq_lens: Optional[List[int]], 
+                              context_lens: Optional[List[int]], 
+                              seq_idx: int) -> Tuple[float, Dict[str, float]]:
+        """
+        Combine current and cached scores using hybrid weighting strategy.
+        
+        The hybrid approach uses:
+        1. Recency bias: Recent tokens get higher weight
+        2. Importance bias: High-scoring tokens get higher weight  
+        3. Balance: Current token gets significant weight but cached tokens matter too
+        
+        Args:
+            current_score: Score of the current token
+            cached_scores: List of scores for cached tokens
+            seq_id: Sequence ID for context
+            seq_lens: List of sequence lengths
+            context_lens: List of context lengths
+            seq_idx: Index in the batch
+            
+        Returns:
+            Tuple of (hybrid_score, weights_dict)
+        """
+        if not cached_scores:
+            # No cached tokens, use current score only
+            return current_score, {'current': 1.0, 'cached': 0.0}
+        
+        # Get sequence context for better weighting
+        seq_len = seq_lens[seq_idx] if seq_lens and seq_idx < len(seq_lens) else len(cached_scores) + 1
+        context_len = context_lens[seq_idx] if context_lens and seq_idx < len(context_lens) else len(cached_scores)
+        
+        # Phase A Hybrid Strategy: Weighted combination with recency and importance bias
+        
+        # 1. Recency weights: More recent tokens get higher weight
+        # Use exponential decay with base 0.9 (recent tokens get ~90% of previous weight)
+        recency_weights = [0.9 ** (len(cached_scores) - 1 - i) for i in range(len(cached_scores))]
+        recency_weights = [w / sum(recency_weights) for w in recency_weights]  # Normalize
+        
+        # 2. Importance weights: High-scoring tokens get higher weight
+        # Use softmax on cached scores to emphasize important tokens
+        if cached_scores:
+            cached_tensor = torch.tensor(cached_scores, dtype=torch.float32)
+            importance_weights = torch.softmax(cached_tensor, dim=0).tolist()
+        else:
+            importance_weights = [1.0] * len(cached_scores)
+        
+        # 3. Combine recency and importance weights
+        combined_weights = [r * i for r, i in zip(recency_weights, importance_weights)]
+        if combined_weights:
+            combined_weights = [w / sum(combined_weights) for w in combined_weights]
+        
+        # 4. Current token weight: Give significant weight to current token
+        # Current token gets weight proportional to sequence length (longer sequences = more context)
+        current_weight = min(0.7, 0.3 + 0.4 * (len(cached_scores) / max(seq_len, 1)))
+        cached_weight = 1.0 - current_weight
+        
+        # 5. Compute weighted cached score
+        weighted_cached_score = sum(c * w for c, w in zip(cached_scores, combined_weights)) if combined_weights else 0.0
+        
+        # 6. Final hybrid score
+        hybrid_score = current_weight * current_score + cached_weight * weighted_cached_score
+        
+        # 7. Store weights for analysis
+        weights = {
+            'current_weight': current_weight,
+            'cached_weight': cached_weight,
+            'recency_weights': recency_weights,
+            'importance_weights': importance_weights,
+            'combined_weights': combined_weights
+        }
+        
+        return hybrid_score, weights
 
 
 # NOTE: this is nn.Module so the profiler can properly capture/group

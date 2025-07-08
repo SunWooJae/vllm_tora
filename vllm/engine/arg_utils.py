@@ -464,6 +464,10 @@ class EngineArgs:
 
     enable_multimodal_encoder_data_parallel: bool = \
         ParallelConfig.enable_multimodal_encoder_data_parallel
+    
+    # ToRA KV cache pruning configuration
+    kv_pruner: Optional[str] = None
+    """KV cache pruning strategy. Currently supports 'tora.block' for ToRA-style pruning."""
 
     def __post_init__(self):
         # support `EngineArgs(compilation_config={...})`
@@ -905,6 +909,13 @@ class EngineArgs:
         vllm_group.add_argument("--additional-config",
                                 **vllm_kwargs["additional_config"])
 
+        # ToRA KV cache pruning arguments
+        parser.add_argument("--kv-pruner",
+                            type=str,
+                            choices=["tora.block"],
+                            default=None,
+                            help="KV cache pruning strategy. Currently supports 'tora.block' for ToRA-style pruning.")
+
         # Other arguments
         parser.add_argument('--use-v2-block-manager',
                             action='store_true',
@@ -1278,7 +1289,7 @@ class EngineArgs:
             compilation_config=self.compilation_config,
             kv_transfer_config=self.kv_transfer_config,
             kv_events_config=self.kv_events_config,
-            additional_config=self.additional_config,
+            additional_config={**self.additional_config, "kv_pruner": self.kv_pruner},
         )
 
         return config
